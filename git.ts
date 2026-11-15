@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { store, type GitObject, type Repo } from './store.ts';
+import { store, repoVersion, touchRepo, type GitObject, type Repo } from './store.ts';
 
 const ZERO = '0'.repeat(40);
 const sha1 = (data: Buffer) => createHash('sha1').update(data).digest();
@@ -130,7 +130,8 @@ function peel(repo: Repo, oid: string): string {
   const seen = new Set<string>(); while (repo.objects.get(oid)?.type === 'tag' && !seen.has(oid)) { seen.add(oid); oid = links(repo.objects.get(oid)!)[0]; } return oid;
 }
 /** Keep REST's derived indexes in sync with the canonical immutable objects. */
-function indexObjects(repo: Repo): void {
+const commitParents = new WeakMap<GitObject, string[]>();
+function indexObjects(repo: Repo, objects: Map<string, GitObject>): void {
   const flatten = (tree: string, prefix = '', files = new Map<string, string>(), active = new Set<string>()): Map<string, string> => {
     if (active.has(tree)) throw new Error('tree cycle'); active.add(tree);
     const object = repo.objects.get(tree);
@@ -140,15 +141,32 @@ function indexObjects(repo: Repo): void {
     }
     active.delete(tree); return files;
   };
-  for (const [id, object] of repo.objects) if (object.type === 'commit' && !repo.commits.has(id)) { const c = parseCommit(object.data); repo.commits.set(id, { parent: c.parents[0] ?? null, message: c.message.replace(/\n$/, ''), tree: flatten(c.tree) }); }
+  for (const [id, object] of objects) if (object.type === 'commit' && !repo.commits.has(id)) { const c = parseCommit(object.data); commitParents.set(repo.objects.get(id)!, c.parents); repo.commits.set(id, { parent: c.parents[0] ?? null, message: c.message.replace(/\n$/, ''), tree: flatten(c.tree) }); }
   for (const branch of repo.files.keys()) if (!repo.refs.has(`refs/heads/${branch}`)) repo.files.delete(branch);
   for (const [ref, id] of repo.refs) if (ref.startsWith('refs/heads/')) repo.files.set(ref.slice(11), new Map(repo.commits.get(id)?.tree ?? []));
 }
 function ancestor(repo: Repo, old: string, tip: string): boolean {
   const seen = new Set<string>(), stack = [tip];
-  while (stack.length) { const id = stack.pop()!; if (id === old) return true; if (seen.has(id)) continue; seen.add(id); const o = repo.objects.get(id); if (o?.type === 'commit') stack.push(...parseCommit(o.data).parents); } return false;
+  while (stack.length) {
+    const id = stack.pop()!; if (id === old) return true; if (seen.has(id)) continue; seen.add(id);
+    const c = repo.commits.get(id), o = repo.objects.get(id);
+    if (c) { const parents = o && commitParents.get(o); if (parents) stack.push(...parents); else if (c.parent) stack.push(c.parent); }
+    else if (o?.type === 'commit') { let parents = commitParents.get(o); if (!parents) { parents = parseCommit(o.data).parents; commitParents.set(o, parents); } stack.push(...parents); }
+  } return false;
 }
+const uploads = new WeakMap<Repo, { version: number; responses: Map<string, Buffer> }>();
 function upload(repo: Repo, data: Buffer, v2: boolean): Buffer {
+  const version = repoVersion(repo);
+  let cache = uploads.get(repo);
+  if (!cache || cache.version !== version) { cache = { version, responses: new Map() }; uploads.set(repo, cache); }
+  // Exact negotiation bytes retain want/have order and every protocol capability.
+  const key = `${v2 ? 2 : 0}:${data.toString('base64')}`;
+  const hit = cache.responses.get(key); if (hit) return hit;
+  const result = buildUpload(repo, data, v2);
+  if (cache.responses.size >= 32) cache.responses.delete(cache.responses.keys().next().value!);
+  cache.responses.set(key, result); return result;
+}
+function buildUpload(repo: Repo, data: Buffer, v2: boolean): Buffer {
   // v0 may contain multiple flush-separated negotiation rounds in one HTTP body.
   let { lines, offset } = packets(data);
   if (!v2) while (offset < data.length) { const next = packets(data.subarray(offset)); lines.push(...next.lines); offset += next.offset; }
@@ -188,6 +206,7 @@ function upload(repo: Repo, data: Buffer, v2: boolean): Buffer {
   return Buffer.concat([...(depthText || shallows.size ? [...shallowLines, FLUSH] : []), pkt('NAK\n'), ...(band ? [...sideband(packed), FLUSH] : [packed])]);
 }
 function receive(repo: Repo, data: Buffer): Buffer {
+  touchRepo(repo);
   const { lines, offset } = packets(data); if (!lines.length) throw new Error('missing commands');
   const caps = lines[0].split('\0')[1] ?? ''; const commands = lines.map(line => {
     const [old, next, ref] = line.split('\0')[0].split(' ');
@@ -195,7 +214,8 @@ function receive(repo: Repo, data: Buffer): Buffer {
     return { old, next, ref };
   });
   let unpack = 'ok';
-  try { if (offset < data.length) { const objects = readPack(data.subarray(offset), repo.objects); for (const [id, obj] of objects) if (!repo.objects.has(id)) repo.objects.set(id, obj); } }
+  let objects = new Map<string, GitObject>();
+  try { if (offset < data.length) { objects = readPack(data.subarray(offset), repo.objects); for (const [id, obj] of objects) if (!repo.objects.has(id)) repo.objects.set(id, obj); } }
   catch (error) { unpack = error instanceof Error ? error.message : 'invalid pack'; }
   const report = [pkt(`unpack ${unpack}\n`)];
   for (const { old, next, ref } of commands) {
@@ -206,7 +226,7 @@ function receive(repo: Repo, data: Buffer): Buffer {
     if (!reason) { if (next === ZERO) repo.refs.delete(ref); else repo.refs.set(ref, next); }
     report.push(pkt(reason ? `ng ${ref} ${reason}\n` : `ok ${ref}\n`));
   }
-  indexObjects(repo); report.push(FLUSH);
+  indexObjects(repo, objects); report.push(FLUSH);
   const result = Buffer.concat(report); return caps.includes('side-band-64k') ? Buffer.concat([...sideband(result), FLUSH]) : result;
 }
 function advertisement(repo: Repo, service: string, v2: boolean): Buffer {
@@ -218,13 +238,13 @@ function advertisement(repo: Repo, service: string, v2: boolean): Buffer {
   if (service === 'git-upload-pack') for (const [name, id] of refs) if (name.startsWith('refs/tags/') && repo.objects.get(id)?.type === 'tag') result.push(pkt(`${peel(repo, id)} ${name}^{}\n`));
   return Buffer.concat([...preamble, ...result, FLUSH]);
 }
-export function gitRouter(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+export function gitRouter(req: IncomingMessage, res: ServerResponse, pathname: string, parsedUrl?: URL): boolean {
   const match = pathname.match(/^\/([^/]+)\/([^/]+)\.git\/(.*)$/); if (!match) return false;
   void (async () => {
     const jsonError = (status: number, message: string) => { res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' }); res.end(JSON.stringify({ message }) + '\n'); };
     try {
       const repo = store.getRepo(decodeURIComponent(match[1]), decodeURIComponent(match[2])); if (!repo) { jsonError(404, 'Not Found'); return; }
-      const url = new URL(req.url!, 'http://forge.local'), v2 = String(req.headers['git-protocol'] ?? '').includes('version=2');
+      const url = parsedUrl ?? new URL(req.url!, 'http://forge.local'), v2 = String(req.headers['git-protocol'] ?? '').includes('version=2');
       let service: string, result: Buffer, kind: string;
       if (req.method === 'GET' && match[3] === 'info/refs') {
         service = url.searchParams.get('service') ?? ''; if (!['git-upload-pack', 'git-receive-pack'].includes(service)) { jsonError(400, 'Invalid service'); return; }

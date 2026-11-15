@@ -1,6 +1,9 @@
 import { createHash } from 'node:crypto';
 
 export type GitObject = { type: 'blob' | 'tree' | 'commit' | 'tag'; data: Buffer };
+const versions = new WeakMap<Repo, number>();
+export function repoVersion(repo: Repo): number { return versions.get(repo) ?? 0; }
+export function touchRepo(repo: Repo): void { versions.set(repo, repoVersion(repo) + 1); }
 export type Repo = { id: number; name: string; owner: string; description: string; private: boolean; defaultBranch: string; createdSeq: number; refs: Map<string, string>; objects: Map<string, GitObject>; files: Map<string, Map<string, string>>; commits: Map<string, { parent: string | null; message: string; tree: Map<string, string> }> };
 export type Label = { name: string; color: string; description: string };
 export type Issue = { number: number; title: string; body: string; state: 'open' | 'closed'; labels: Label[]; comments: { id: number; body: string; createdSeq: number }[]; createdSeq: number; updatedSeq: number };
@@ -27,12 +30,13 @@ export class ForgeStore {
     return repo;
   }
   getRepo(owner: string, name: string): Repo | undefined { return this.repos.get(this.key(owner, name)); }
-  deleteRepo(repo: Repo): void { this.repos.delete(this.key(repo.owner, repo.name)); }
+  deleteRepo(repo: Repo): void { touchRepo(repo); this.repos.delete(this.key(repo.owner, repo.name)); }
   listRepos(owner: string): Repo[] { return [...this.repos.values()].filter((r) => r.owner.toLowerCase() === owner.toLowerCase()).sort((a,b) => a.createdSeq-b.createdSeq); }
   deleteFile(repo: Repo, branch: string, path: string): boolean { const files = repo.files.get(branch); if (!files?.has(path)) return false; files.delete(path); return true; }
   branchFiles(repo: Repo, branch: string): Map<string,string> { let files=repo.files.get(branch); if (!files) { files=new Map(); repo.files.set(branch, files); } return files; }
   addObject(repo: Repo, type: GitObject['type'], data: Buffer): string { const raw=Buffer.concat([Buffer.from(`${type} ${data.length}\0`),data]); const sha=createHash('sha1').update(raw).digest('hex'); if (!repo.objects.has(sha)) repo.objects.set(sha,{type,data}); return sha; }
   commit(repo: Repo, branch: string, message: string, files: Map<string,string>, parent: string | null): string {
+    touchRepo(repo);
     const root = new Map<string, unknown>();
     for (const [path, blob] of files) {
       const parts=path.split('/'); let node=root;

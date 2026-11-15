@@ -1,9 +1,11 @@
 import { createHash } from 'node:crypto';
 import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { store, type Repo, type Pull, type Issue } from './store.ts';
+import { store, touchRepo, type Repo, type Pull, type Issue } from './store.ts';
 
 type Obj = Record<string, any>;
+const logins = new Map<string, string>();
+const authTokens = new Map<string, string | undefined>();
 // In-process API adapter: all public surfaces use the same validation and mutations.
 export async function restCall(method: string, path: string, input: Obj = {}): Promise<any> {
   const request = Readable.from([JSON.stringify(input)]) as IncomingMessage;
@@ -16,8 +18,8 @@ export async function restCall(method: string, path: string, input: Obj = {}): P
   return result;
 }
 const json = (res: ServerResponse, status: number, value?: unknown, extra: Record<string,string> = {}) => {
-  const body = value === undefined ? '' : `${JSON.stringify(value)}\n`;
-  res.writeHead(status, { 'x-github-request-id': 'MF0000000001', ...(body ? { 'content-type':'application/json; charset=utf-8', 'content-length':String(Buffer.byteLength(body)) } : {}), ...extra }); res.end(body);
+  const body = Buffer.from(value === undefined ? '' : `${JSON.stringify(value)}\n`);
+  res.writeHead(status, { 'x-github-request-id': 'MF0000000001', ...(body.length ? { 'content-type':'application/json; charset=utf-8', 'content-length':String(body.length) } : {}), ...extra }); res.end(body);
 };
 const error = (res: ServerResponse, status: number, message: string) => json(res,status,{message});
 async function body(req: IncomingMessage): Promise<Obj> { let data=''; for await (const part of req) data += part; if (!data) return {}; try { const parsed=JSON.parse(data); return parsed && typeof parsed==='object' ? parsed : {}; } catch { throw new Error('bad-json'); } }
@@ -57,15 +59,18 @@ function lineChanges(before: Buffer | undefined, after: Buffer | undefined): { a
   for(let i=left.length-1;i>=0;i--)for(let j=right.length-1;j>=0;j--)rows[i]![j]=left[i]===right[j]?rows[i+1]![j+1]!+1:Math.max(rows[i+1]![j]!,rows[i]![j+1]!);
   const common=rows[0]![0]!; return {additions:right.length-common,deletions:left.length-common};
 }
-export function restRouter(req: IncomingMessage, res: ServerResponse, pathname: string): boolean {
+export function restRouter(req: IncomingMessage, res: ServerResponse, pathname: string, url?: URL): boolean {
   if (pathname !== '/api/v3' && pathname !== '/api/v3/' && !pathname.startsWith('/api/v3/')) return false;
-  void handle(req,res,pathname); return true;
+  void handle(req,res,pathname,url); return true;
 }
-async function handle(req: IncomingMessage,res: ServerResponse,pathname: string): Promise<void> {
-  const auth=req.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1]; const token=process.env.MAKEFUN_SHOP_TOKEN;
+async function handle(req: IncomingMessage,res: ServerResponse,pathname: string, parsedUrl?: URL): Promise<void> {
+  const header=req.headers.authorization;
+  if (header !== undefined && !authTokens.has(header)) authTokens.set(header, header.match(/^Bearer\s+(.+)$/i)?.[1]);
+  const auth=header === undefined ? undefined : authTokens.get(header); const token=process.env.MAKEFUN_SHOP_TOKEN;
   if (!auth || !token || auth !== token) { error(res,401,'Bad credentials'); return; }
-  const login=(token.match(/^(?:login|user|github):([A-Za-z0-9][A-Za-z0-9-]*)$/i)?.[1] ?? 'adaiversen');
-  const url=new URL(req.url ?? pathname,'http://forge.local'); const method=req.method ?? 'GET';
+  let login=logins.get(token);
+  if (login === undefined) { login=token.match(/^(?:login|user|github):([A-Za-z0-9][A-Za-z0-9-]*)$/i)?.[1] ?? 'adaiversen'; logins.set(token,login); }
+  const url=parsedUrl ?? new URL(req.url ?? pathname,'http://forge.local'); const method=req.method ?? 'GET';
   let input: Obj={}; if (['POST','PUT','PATCH','DELETE'].includes(method) && req.headers['content-type']?.includes('application/json')) { try { input=await body(req); } catch { error(res,400,'Malformed JSON'); return; } }
   if (pathname==='/api/v3/' || pathname==='/api/v3') { json(res,200,{current_user_url:'/api/v3/user'},{'x-oauth-scopes':'repo, read:org'}); return; }
   if (pathname==='/api/v3/meta' && method==='GET') { json(res,200,{installed_version:'3.0.0'}); return; }
@@ -75,6 +80,7 @@ async function handle(req: IncomingMessage,res: ServerResponse,pathname: string)
   }
   const parts=pathname.slice('/api/v3/repos/'.length).split('/').map(decodeURIComponent); if(parts.length<2){error(res,404,'Not Found');return;}
   const [owner,name,...tail]=parts; if(owner.toLowerCase()!==login.toLowerCase()){error(res,404,'Not Found');return;} const repo=store.getRepo(owner,name);
+  if (repo && ['POST','PUT','PATCH','DELETE'].includes(method)) touchRepo(repo);
   if(tail.length===0) { if(!repo){error(res,404,'Not Found');return;} if(method==='GET'){json(res,200,repoView(repo));return;} if(method==='PATCH'){repo.description=String(input.description??repo.description);json(res,200,repoView(repo));return;} if(method==='DELETE'){store.deleteRepo(repo);json(res,204);return;} }
   if(!repo){error(res,404,'Not Found');return;}
   if(tail[0]==='labels' && method==='POST') { const label={name:String(input.name??''),color:String(input.color??'ededed'),description:String(input.description??'')}; if(!label.name){error(res,422,'Validation Failed');return;} store.addLabel(repo,label);json(res,201,label);return; }
