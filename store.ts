@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto';
 
-export type GitObject = { type: 'blob' | 'tree' | 'commit'; data: Buffer };
+export type GitObject = { type: 'blob' | 'tree' | 'commit' | 'tag'; data: Buffer };
 export type Repo = { id: number; name: string; owner: string; description: string; private: boolean; defaultBranch: string; createdSeq: number; refs: Map<string, string>; objects: Map<string, GitObject>; files: Map<string, Map<string, string>>; commits: Map<string, { parent: string | null; message: string; tree: Map<string, string> }> };
 export type Label = { name: string; color: string; description: string };
 export type Issue = { number: number; title: string; body: string; state: 'open' | 'closed'; labels: Label[]; comments: { id: number; body: string; createdSeq: number }[]; createdSeq: number; updatedSeq: number };
@@ -31,7 +31,7 @@ export class ForgeStore {
   listRepos(owner: string): Repo[] { return [...this.repos.values()].filter((r) => r.owner.toLowerCase() === owner.toLowerCase()).sort((a,b) => a.createdSeq-b.createdSeq); }
   deleteFile(repo: Repo, branch: string, path: string): boolean { const files = repo.files.get(branch); if (!files?.has(path)) return false; files.delete(path); return true; }
   branchFiles(repo: Repo, branch: string): Map<string,string> { let files=repo.files.get(branch); if (!files) { files=new Map(); repo.files.set(branch, files); } return files; }
-  addObject(repo: Repo, type: GitObject['type'], data: Buffer): string { const raw=Buffer.concat([Buffer.from(`${type} ${data.length}\0`),data]); const sha=createHash('sha1').update(raw).digest('hex'); repo.objects.set(sha,{type,data}); return sha; }
+  addObject(repo: Repo, type: GitObject['type'], data: Buffer): string { const raw=Buffer.concat([Buffer.from(`${type} ${data.length}\0`),data]); const sha=createHash('sha1').update(raw).digest('hex'); if (!repo.objects.has(sha)) repo.objects.set(sha,{type,data}); return sha; }
   commit(repo: Repo, branch: string, message: string, files: Map<string,string>, parent: string | null): string {
     const root = new Map<string, unknown>();
     for (const [path, blob] of files) {
@@ -41,7 +41,7 @@ export class ForgeStore {
     }
     const buildTree=(node: Map<string,unknown>): string => {
       const entries: Buffer[]=[];
-      for (const [name,value] of [...node].sort(([a],[b])=>a.localeCompare(b))) {
+      for (const [name,value] of [...node].sort(([a,av],[b,bv])=>Buffer.compare(Buffer.from(a+(av instanceof Map?'/':'')),Buffer.from(b+(bv instanceof Map?'/':''))))) {
         const directory=value instanceof Map; const sha=directory ? buildTree(value as Map<string,unknown>) : String(value);
         entries.push(Buffer.from(`${directory?'40000':'100644'} ${name}\0`),Buffer.from(sha,'hex'));
       }

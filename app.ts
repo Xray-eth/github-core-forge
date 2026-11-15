@@ -1,10 +1,11 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { restRouter } from './rest.ts';
+import { gitRouter } from './git.ts';
 
 type RequestRouter = (request: IncomingMessage, response: ServerResponse, pathname: string) => boolean;
 
 const contentType = 'application/json; charset=utf-8';
-const routers: readonly RequestRouter[] = [restRouter];
+const routers: readonly RequestRouter[] = [gitRouter, restRouter];
 
 function replyJson(response: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}): void {
   const body = `${JSON.stringify(value)}\n`;
