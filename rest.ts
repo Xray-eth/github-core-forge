@@ -1,8 +1,20 @@
 import { createHash } from 'node:crypto';
+import { Readable } from 'node:stream';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { store, type Repo, type Pull, type Issue } from './store.ts';
 
 type Obj = Record<string, any>;
+// In-process API adapter: all public surfaces use the same validation and mutations.
+export async function restCall(method: string, path: string, input: Obj = {}): Promise<any> {
+  const request = Readable.from([JSON.stringify(input)]) as IncomingMessage;
+  request.method = method; request.url = `/api/v3${path}`;
+  request.headers = { authorization: `Bearer ${process.env.MAKEFUN_SHOP_TOKEN}`, 'content-type': 'application/json' };
+  let status = 200, result: any;
+  const response = { writeHead(code: number) { status = code; }, end(text: string) { result = text ? JSON.parse(text) : null; } } as unknown as ServerResponse;
+  await handle(request, response, request.url.split('?')[0]!);
+  if (status >= 400) throw new Error(result?.message ?? 'Request failed');
+  return result;
+}
 const json = (res: ServerResponse, status: number, value?: unknown, extra: Record<string,string> = {}) => {
   const body = value === undefined ? '' : `${JSON.stringify(value)}\n`;
   res.writeHead(status, { 'x-github-request-id': 'MF0000000001', ...(body ? { 'content-type':'application/json; charset=utf-8', 'content-length':String(Buffer.byteLength(body)) } : {}), ...extra }); res.end(body);
@@ -11,7 +23,7 @@ const error = (res: ServerResponse, status: number, message: string) => json(res
 async function body(req: IncomingMessage): Promise<Obj> { let data=''; for await (const part of req) data += part; if (!data) return {}; try { const parsed=JSON.parse(data); return parsed && typeof parsed==='object' ? parsed : {}; } catch { throw new Error('bad-json'); } }
 function repoView(r: Repo): Obj { return { id:r.id,node_id:`R_${r.id}`,name:r.name,full_name:`${r.owner}/${r.name}`,owner:{login:r.owner},private:r.private,description:r.description,default_branch:r.defaultBranch }; }
 function issueView(r: Repo,i: Issue): Obj { return { id:i.createdSeq,node_id:`I_${r.id}_${i.number}`,number:i.number,title:i.title,body:i.body,state:i.state,labels:i.labels.map(x=>({...x})),comments:i.comments.length,created_at:`seq-${i.createdSeq}`,updated_at:`seq-${i.updatedSeq}`,html_url:`/api/v3/repos/${r.owner}/${r.name}/issues/${i.number}` }; }
-function pullView(r: Repo,p: Pull): Obj { return { id:p.createdSeq,number:p.number,title:p.title,body:p.body,state:p.state,head:{ref:p.head.ref,sha:p.head.sha},base:{ref:p.base.ref,sha:p.base.sha},merged:p.merged,merged_at:p.mergedAt,merge_commit_sha:p.mergeCommitSha }; }
+function pullView(r: Repo,p: Pull): Obj { return { id:p.createdSeq,node_id:`P_${r.id}_${p.number}`,number:p.number,title:p.title,body:p.body,state:p.merged?'closed':p.state,head:{ref:p.head.ref,sha:p.head.sha},base:{ref:p.base.ref,sha:p.base.sha},merged:p.merged,merged_at:p.mergedAt,merge_commit_sha:p.mergeCommitSha }; }
 function contentCommit(r: Repo, branch: string, path: string, value?: Buffer, message='update file'): string {
   const files=new Map(store.branchFiles(r,branch));
   if (value === undefined) files.delete(path); else { const blob=store.addObject(r,'blob',value); files.set(path,blob); }
