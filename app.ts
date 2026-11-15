@@ -1,11 +1,10 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { restRouter } from './rest.ts';
 
 type RequestRouter = (request: IncomingMessage, response: ServerResponse, pathname: string) => boolean;
 
 const contentType = 'application/json; charset=utf-8';
-const routers: readonly RequestRouter[] = [
-  // Future surfaces can claim their path prefixes here: REST, git, GraphQL, and MCP.
-];
+const routers: readonly RequestRouter[] = [restRouter];
 
 function replyJson(response: ServerResponse, status: number, value: unknown, headers: Record<string, string> = {}): void {
   const body = `${JSON.stringify(value)}\n`;
@@ -32,11 +31,6 @@ export function createApp(): Server {
 
     if (method === 'GET' && path === '/healthz') {
       replyJson(response, 200, { ok: true });
-      return;
-    }
-
-    if (method === 'GET' && (path === '/api/v3' || path === '/api/v3/')) {
-      replyJson(response, 200, { current_user_url: '/api/v3/user' }, { 'x-oauth-scopes': 'repo, read:org' });
       return;
     }
 
