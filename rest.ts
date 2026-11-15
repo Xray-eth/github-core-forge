@@ -30,6 +30,23 @@ function contentCommit(r: Repo, branch: string, path: string, value?: Buffer, me
   const parent=r.refs.get(`refs/heads/${branch}`) ?? null; return store.commit(r,branch,message,files,parent);
 }
 function branchName(ref: string): string { return ref.replace(/^refs\/heads\//,''); }
+function directorySha(repo: Repo, branch: string, path: string): string | undefined {
+  const tip = repo.refs.get(`refs/heads/${branch}`);
+  let tree = tip && repo.objects.get(tip)?.data.toString().match(/^tree ([0-9a-f]{40})/m)?.[1];
+  for (const name of path.split('/').filter(Boolean)) {
+    const data = tree && repo.objects.get(tree)?.data;
+    if (!data) return undefined;
+    let found: string | undefined;
+    for (let offset = 0; offset < data.length;) {
+      const space = data.indexOf(32, offset), nul = data.indexOf(0, space);
+      if (space < 0 || nul < 0) return undefined;
+      if (data.subarray(space + 1, nul).toString() === name) found = data.subarray(nul + 1, nul + 21).toString('hex');
+      offset = nul + 21;
+    }
+    tree = found;
+  }
+  return tree || undefined;
+}
 function ancestors(repo: Repo, sha: string): string[] { const out:string[]=[]; let current:string|undefined=sha; while(current){out.push(current);current=repo.commits.get(current)?.parent??undefined;} return out; }
 function mergeBase(repo: Repo, left: string, right: string): string | undefined { const leftSet=new Set(ancestors(repo,left)); return ancestors(repo,right).find(sha=>leftSet.has(sha)); }
 function lineChanges(before: Buffer | undefined, after: Buffer | undefined): { additions: number; deletions: number } {
@@ -54,7 +71,7 @@ async function handle(req: IncomingMessage,res: ServerResponse,pathname: string)
   if (pathname==='/api/v3/meta' && method==='GET') { json(res,200,{installed_version:'3.0.0'}); return; }
   if (pathname==='/api/v3/user/repos') {
     if(method==='POST') { const name=String(input.name ?? ''); if(!name) {error(res,422,'Validation Failed');return;} try { const r=store.createRepo(login,name,String(input.description??''),input.private!==false,String(input.default_branch??'main')); json(res,201,repoView(r)); } catch {error(res,422,'Repository already exists');} return; }
-    if(method==='GET') { const all=store.listRepos(login); const page=Math.max(1,Number(url.searchParams.get('page')??1)); const per=Math.max(1,Math.min(100,Number(url.searchParams.get('per_page')??30))); const items=all.slice((page-1)*per,page*per); const headers:Record<string,string>={}; if(page*per<all.length) {const next=new URL(url);next.searchParams.set('page',String(page+1));headers.link=`<${next.pathname}${next.search}>; rel="next"`; } json(res,200,items.map(repoView),headers); return; }
+    if(method==='GET') { const all=store.listRepos(login); const page=Math.max(1,Number(url.searchParams.get('page')??1)); const per=Math.max(1,Math.min(100,Number(url.searchParams.get('per_page')??30))); const items=all.slice((page-1)*per,page*per); const headers:Record<string,string>={}; if(page*per<all.length) {const next=new URL(url);next.searchParams.set('page',String(page+1));headers.link=`<http://${req.headers.host}${next.pathname}${next.search}>; rel="next"`; } json(res,200,items.map(repoView),headers); return; }
   }
   const parts=pathname.slice('/api/v3/repos/'.length).split('/').map(decodeURIComponent); if(parts.length<2){error(res,404,'Not Found');return;}
   const [owner,name,...tail]=parts; if(owner.toLowerCase()!==login.toLowerCase()){error(res,404,'Not Found');return;} const repo=store.getRepo(owner,name);
@@ -72,8 +89,8 @@ async function handle(req: IncomingMessage,res: ServerResponse,pathname: string)
   if(tail[0]==='branches'&&method==='GET'){json(res,200,[...repo.refs].filter(([ref])=>ref.startsWith('refs/heads/')).map(([ref,sha])=>({name:branchName(ref),commit:{sha}})));return;}
   if(tail[0]==='commits'&&method==='GET'){const branch=branchName(url.searchParams.get('sha')??repo.defaultBranch);let sha=repo.refs.get(`refs/heads/${branch}`);const out=[];while(sha){const c=repo.commits.get(sha);if(!c)break;out.push({sha,commit:{message:c.message}});sha=c.parent??undefined;}json(res,200,out);return;}
   if(tail[0]==='contents'){
-    const path=tail.slice(1).join('/'); const branch=branchName(url.searchParams.get('branch')??url.searchParams.get('ref')??repo.defaultBranch); const files=store.branchFiles(repo,branch); const existing=files.get(path);
-    if(method==='GET'){if(existing){const object=repo.objects.get(existing)!;json(res,200,{name:path.split('/').pop(),path,sha:existing,size:object.data.length,type:'file',encoding:'base64',content:object.data.toString('base64')});return;}const prefix=path?`${path}/`:'';const children=new Set<string>();for(const file of files.keys())if(file.startsWith(prefix)){const rest=file.slice(prefix.length);children.add(rest.split('/')[0]!);}if(children.size){json(res,200,[...children].sort().map(x=>({name:x,path:prefix+x,type:files.has(prefix+x)?'file':'dir'})));return;}error(res,404,'Not Found');return;}
+    const path=tail.slice(1).join('/'); const branch=branchName(input.branch??url.searchParams.get('branch')??url.searchParams.get('ref')??repo.defaultBranch); const files=store.branchFiles(repo,branch); const existing=files.get(path);
+    if(method==='GET'){if(existing){const object=repo.objects.get(existing)!;json(res,200,{name:path.split('/').pop(),path,sha:existing,size:object.data.length,type:'file',encoding:'base64',content:object.data.toString('base64')});return;}const prefix=path?`${path}/`:'';const children=new Set<string>();for(const file of files.keys())if(file.startsWith(prefix)){const rest=file.slice(prefix.length);children.add(rest.split('/')[0]!);}if(children.size){json(res,200,[...children].sort().map(x=>({name:x,path:prefix+x,type:files.has(prefix+x)?'file':'dir',sha:files.get(prefix+x)??directorySha(repo,branch,prefix+x)})));return;}error(res,404,'Not Found');return;}
     if(method==='PUT'){if(existing&&input.sha!==existing){error(res,409,'sha does not match');return;}const commit=contentCommit(repo,branch,path,Buffer.from(String(input.content??''),'base64'),String(input.message??'update file'));const blob=store.branchFiles(repo,branch).get(path)!;json(res,existing?200:201,{content:{name:path.split('/').pop(),path,sha:blob,encoding:'base64'},commit:{sha:commit,message:String(input.message??'update file')}});return;}
     if(method==='DELETE'){if(!existing){error(res,404,'Not Found');return;}if(input.sha!==existing){error(res,409,'sha does not match');return;}const commit=contentCommit(repo,branch,path,undefined,String(input.message??'delete file'));json(res,200,{commit:{sha:commit}});return;}
   }
